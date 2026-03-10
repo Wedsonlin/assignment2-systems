@@ -1,14 +1,19 @@
 import argparse
 
-import torch
 import timeit
 import numpy as np
 import pandas as pd
+import torch
+import torch.cuda.nvtx as nvtx
 
+import cs336_basics
+from cs336_basics.model import annotated_scaled_dot_product_attention
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.data import get_batch
-from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.nn_utils import cross_entropy
+
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 args = argparse.ArgumentParser()
 
@@ -31,17 +36,17 @@ model = BasicsTransformerLM(
     num_heads=args.num_heads,
     d_ff=args.d_ff,
     rope_theta=args.rope_theta,
-)
-model = model.to(device)
+).to(device)
 
 optimizer = AdamW(model.parameters())
 
 dataset = np.random.randint(0,args.vocab_size,size=(1000,))
 
-timer = timeit.default_timer()
+timer = timeit.default_timer
 
 w = 5 # warm-up steps
 n = 10 # profile steps
+batch_size = 128
 
 def forward(model, x):
     model(x)
@@ -50,26 +55,33 @@ def backward(loss):
     loss.backward()
 
 def single_step(dataset, model, optimizer):
-    x,gt = get_batch(dataset, batch_size=4, context_length=args.context_length, device="cuda")
+    x,gt = get_batch(dataset, batch_size=batch_size, context_length=args.context_length, device="cuda")
 
     start_time = timer()
+    # nvtx.range_push(f"forwrad-bs{batch_size}")
     y = model(x)
+    torch.cuda.synchronize()
+    # nvtx.range_pop()
     end_time = timer()
     forward_time = end_time - start_time
 
-    train_loss = cross_entropy(y, gt)
-    optimizer.zero_grad()
+    # train_loss = cross_entropy(y, gt)
+    # optimizer.zero_grad()
 
-    start_time = timer()
-    train_loss.backward()
-    end_time = timer()
-    backward_time = end_time - start_time
+    # start_time = timer()
+    # # nvtx.range_push(f"backward-bs{batch_size}")
+    # train_loss.backward()
+    # torch.cuda.synchronize()
+    # # nvtx.range_pop()
+    # end_time = timer()
+    # backward_time = end_time - start_time
 
-    clip_gradient(model.parameters(), max_l2_norm=1.0)
-    optimizer.step()
+    # # nvtx.range_push(f"optimizer step-bs{batch_size}")
+    # optimizer.step()
     torch.cuda.synchronize()
+    # nvtx.range_pop()
 
-    return forward_time, backward_time
+    return forward_time, 0
 
 def cal_ave_and_std(time_list):
     mean = np.mean(time_list)
