@@ -2,6 +2,7 @@ import timeit
 import argparse
 from typing import Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
 from cs336_basics.model import BasicsTransformerLM
@@ -61,6 +62,7 @@ def benchmark(
 
     elif pattern == "forward-and-backward":
         for i in range(warmup_steps):
+            optimizer.zero_grad()
             output = model(warmup_inputs[i])
             loss = cross_entropy(output, warmup_targets[i])
             loss.backward()
@@ -68,6 +70,7 @@ def benchmark(
 
         start = timeit.default_timer()
         for i in range(execution_steps):
+            optimizer.zero_grad()
             output = model(execution_inputs[i])
             loss = cross_entropy(output, execution_targets[i])
             loss.backward()
@@ -76,15 +79,14 @@ def benchmark(
         return (end - start) / execution_steps
 
     elif pattern == "full-training-step":
-        optimizer.zero_grad()
         for i in range(warmup_steps):
+            optimizer.zero_grad()
             output = model(warmup_inputs[i])
             loss = cross_entropy(output, warmup_targets[i])
             loss.backward()
             optimizer.step()
         torch.cuda.synchronize()
         
-        optimizer.zero_grad()
         start = timeit.default_timer()
         for i in range(execution_steps):
             optimizer.zero_grad()
@@ -108,6 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--pattern", type=str, default="forward-only")
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--execution-steps", type=int, default=10)
+    parser.add_argument("--repeat-times", type=int, default=10)
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,12 +125,16 @@ if __name__ == "__main__":
     model.to(device)
     optimizer = AdamW(model.parameters())
     
-    latency = benchmark(
-        model=model, 
-        optimizer=optimizer,
-        device=device,
-        warmup_steps=args.warmup_steps,
-        execution_steps=args.execution_steps,
-        pattern=args.pattern,
-    )
-    print(f"Latency: {latency} seconds")
+    lantecys = []
+    for _ in range(args.repeat_times):
+        lantecys.append(benchmark(
+            model=model, 
+            optimizer=optimizer,
+            device=device,
+            warmup_steps=args.warmup_steps,
+            execution_steps=args.execution_steps,
+            pattern=args.pattern,
+        ))
+    avg = np.mean(lantecys)
+    std = np.std(lantecys)
+    print(f"Latency: {avg:.5f} seconds ± {std:.5f} seconds")

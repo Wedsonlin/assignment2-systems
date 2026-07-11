@@ -6,6 +6,7 @@
 #   ./run_benchmark_configs.sh [--size SIZE]... [--pattern PATTERN]
 #                               [--warmup-steps N] [--execution-steps N]
 #                               [--vocab-size N] [--context-length N]
+#                               [--repeat-times N]
 #                               [-- EXTRA_BENCHMARK_ARGS]
 #
 # --size can be repeated or given as a comma-separated list; defaults to "all".
@@ -15,7 +16,7 @@
 #   ./run_benchmark_configs.sh --size small --pattern forward-and-backward
 #   ./run_benchmark_configs.sh --size small --size medium
 #   ./run_benchmark_configs.sh --size small,medium,large
-#   ./run_benchmark_configs.sh --size all -- --execution-steps 20
+#   ./run_benchmark_configs.sh --size all --repeat-times 20
 
 set -euo pipefail
 
@@ -37,6 +38,7 @@ warmup_steps=5
 execution_steps=10
 vocab_size=10000
 context_length=512
+repeat_times=10
 extra_args=()
 
 usage() {
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
       context_length="$2"
       shift 2
       ;;
+    --repeat-times)
+      repeat_times="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       ;;
@@ -90,11 +96,11 @@ if [[ ${#sizes[@]} -eq 0 || "${sizes[0]}" == "all" ]]; then
   sizes=("${ORDER[@]}")
 fi
 
-echo "Pattern=${pattern} warmup_steps=${warmup_steps} execution_steps=${execution_steps}"
+echo "Pattern=${pattern} warmup_steps=${warmup_steps} execution_steps=${execution_steps} repeat_times=${repeat_times}"
 echo "Sizes to run: ${sizes[*]}"
 echo
 
-printf "%-8s %-9s %-8s %-11s %-10s %-15s\n" "size" "d_model" "d_ff" "num_layers" "num_heads" "latency(sec)"
+printf "%-8s %-9s %-8s %-11s %-10s %-15s %-15s\n" "size" "d_model" "d_ff" "num_layers" "num_heads" "mean(sec)" "std(sec)"
 
 for size in "${sizes[@]}"; do
   if [[ -z "${CONFIGS[$size]+x}" ]]; then
@@ -114,6 +120,7 @@ for size in "${sizes[@]}"; do
     --pattern "$pattern" \
     --warmup-steps "$warmup_steps" \
     --execution-steps "$execution_steps" \
+    --repeat-times "$repeat_times" \
     "${extra_args[@]}" 2>&1)
   status=$?
   set -e
@@ -121,10 +128,16 @@ for size in "${sizes[@]}"; do
   if [[ $status -ne 0 ]]; then
     echo "[$size] FAILED (exit $status):" >&2
     echo "$output" >&2
-    printf "%-8s %-9s %-8s %-11s %-10s %-15s\n" "$size" "$d_model" "$d_ff" "$num_layers" "$num_heads" "ERROR"
+    printf "%-8s %-9s %-8s %-11s %-10s %-15s %-15s\n" "$size" "$d_model" "$d_ff" "$num_layers" "$num_heads" "ERROR" "ERROR"
     continue
   fi
 
-  latency=$(echo "$output" | grep -oP 'Latency:\s*\K[0-9.eE+-]+' || true)
-  printf "%-8s %-9s %-8s %-11s %-10s %-15s\n" "$size" "$d_model" "$d_ff" "$num_layers" "$num_heads" "${latency:-N/A}"
+  # benchmark.py prints: "Latency: <mean> seconds ± <std> seconds"
+  mean="N/A"
+  std="N/A"
+  if [[ "$output" =~ Latency:\ ([0-9.eE+-]+)\ seconds\ ±\ ([0-9.eE+-]+)\ seconds ]]; then
+    mean="${BASH_REMATCH[1]}"
+    std="${BASH_REMATCH[2]}"
+  fi
+  printf "%-8s %-9s %-8s %-11s %-10s %-15s %-15s\n" "$size" "$d_model" "$d_ff" "$num_layers" "$num_heads" "$mean" "$std"
 done
