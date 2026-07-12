@@ -8,6 +8,8 @@
 # Usage:
 #   ./run_profile_configs.sh [--size SIZE]... [--context-length N]...
 #                             [--vocab-size N] [--warmup-steps N] [--execution-steps N]
+#                             [--autocast true|false] [--memory-profile true|false]
+#                             [--pattern forward-only|full-training-step]
 #                             [--output-dir DIR] [--trace ARG]
 #                             [-- EXTRA_PROFILE_PY_ARGS]
 #
@@ -15,10 +17,18 @@
 # comma-separated list. --size defaults to "all"; --context-length defaults
 # to 512.
 #
+# --memory-profile true switches nsys_profile.py into memory_profile() mode
+# (dumps a *_memory_snapshot.pickle instead of running the nvtx-annotated
+# pass). Since that mode never emits the "benchmark_execution" NVTX range and
+# nsys has nothing useful to capture, this script runs it directly via
+# `uv run python ...` (no nsys wrapper, no .nsys-rep output). Otherwise it
+# runs via `uv run nsys profile ... -- python ...` as before.
+#
 # Examples:
 #   ./run_profile_configs.sh                                    # profile all sizes at ctx=512
 #   ./run_profile_configs.sh --size small --context-length 512
 #   ./run_profile_configs.sh --size small,medium --context-length 128,512
+#   ./run_profile_configs.sh --size all --memory-profile true --pattern full-training-step
 #   ./run_profile_configs.sh --size all -- --warmup-steps 3 --execution-steps 5
 
 set -euo pipefail
@@ -42,6 +52,9 @@ warmup_steps=5
 execution_steps=10
 output_dir="../results"
 trace="cuda,nvtx,osrt"
+autocast="false"
+memory_profile="false"
+pattern="forward-only"
 extra_args=()
 
 usage() {
@@ -81,6 +94,18 @@ while [[ $# -gt 0 ]]; do
       trace="$2"
       shift 2
       ;;
+    --autocast)
+      autocast="$2"
+      shift 2
+      ;;
+    --memory-profile)
+      memory_profile="$2"
+      shift 2
+      ;;
+    --pattern)
+      pattern="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       ;;
@@ -106,6 +131,7 @@ fi
 mkdir -p "$output_dir"
 
 echo "vocab_size=${vocab_size} warmup_steps=${warmup_steps} execution_steps=${execution_steps} trace=${trace}"
+echo "autocast=${autocast} memory_profile=${memory_profile} pattern=${pattern}"
 echo "Sizes to run: ${sizes[*]}"
 echo "Context lengths: ${context_lengths[*]}"
 echo "Output dir: ${output_dir}"
@@ -122,27 +148,45 @@ for size in "${sizes[@]}"; do
   for context_length in "${context_lengths[@]}"; do
     out_name="${size}_ctx${context_length}"
     out_path="${output_dir}/${out_name}"
-    echo "==> Profiling ${size} (ctx=${context_length}) -> ${out_path}"
+    if [[ "$memory_profile" == "true" ]]; then
+      echo "==> Profiling ${size} (ctx=${context_length}) [memory-profile mode, no nsys wrapper]"
+    else
+      echo "==> Profiling ${size} (ctx=${context_length}) -> ${out_path}"
+    fi
+
+    py_args=(
+      --vocab_size "$vocab_size"
+      --context_length "$context_length"
+      --d_model "$d_model"
+      --d_ff "$d_ff"
+      --num_layers "$num_layers"
+      --num_heads "$num_heads"
+      --model_name "$size"
+      --warmup-steps "$warmup_steps"
+      --execution-steps "$execution_steps"
+      --autocast "$autocast"
+      --memory-profile "$memory_profile"
+      --pattern "$pattern"
+      "${extra_args[@]}"
+    )
 
     set +e
-    uv run nsys profile \
-      -o "$out_path" \
-      --force-overwrite=true \
-      --capture-range=nvtx \
-      --nvtx-capture=benchmark_execution \
-      -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 \
-      --capture-range-end=stop \
-      --trace="$trace" \
-      python ../cs336_systems/nsys_profile.py \
-        --vocab_size "$vocab_size" \
-        --context_length "$context_length" \
-        --d_model "$d_model" \
-        --d_ff "$d_ff" \
-        --num_layers "$num_layers" \
-        --num_heads "$num_heads" \
-        --warmup-steps "$warmup_steps" \
-        --execution-steps "$execution_steps" \
-        "${extra_args[@]}"
+    if [[ "$memory_profile" == "true" ]]; then
+      # memory_profile() never emits the "benchmark_execution" NVTX range and
+      # just dumps a *_memory_snapshot.pickle itself, so there is nothing for
+      # nsys to usefully capture here: run the script directly instead.
+      uv run python ../cs336_systems/nsys_profile.py "${py_args[@]}"
+    else
+      uv run nsys profile \
+        -o "$out_path" \
+        --force-overwrite=true \
+        --capture-range=nvtx \
+        --nvtx-capture=benchmark_execution \
+        -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 \
+        --capture-range-end=stop \
+        --trace="$trace" \
+        -- python ../cs336_systems/nsys_profile.py "${py_args[@]}"
+    fi
     status=$?
     set -e
 

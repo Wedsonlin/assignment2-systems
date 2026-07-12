@@ -58,14 +58,106 @@ def annotated_scaled_dot_product_attention(
 
     return output
 
-cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
-def profile(
+def memory_profile(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    model_name: str,
+    warmup_steps: int = 5,
+    autocast: bool = False,
+    pattern: Literal["forward-only", "full-training-step"] = "forward-only",
+):
+    execution_steps = 1
+    batch_size = 4
+    warmup_inputs = torch.randint(
+            low=0,
+            high=model.config["vocab_size"],
+            size=(warmup_steps, batch_size, model.config["context_length"]),
+            dtype=torch.long,
+            device=device
+        )
+    execution_inputs = torch.randint(
+            low=0,
+            high=model.config["vocab_size"],
+            size=(execution_steps, batch_size, model.config["context_length"]),
+            dtype=torch.long,
+            device=device
+        )
+    if pattern == "full-training-step":
+        warmup_targets = torch.randint(
+                low=0,
+                high=model.config["vocab_size"],
+                size=(warmup_steps, batch_size, model.config["context_length"]),
+                dtype=torch.long,
+                device=device       
+            )
+        execution_targets = torch.randint(
+                low=0,
+                high=model.config["vocab_size"],
+                size=(execution_steps, batch_size, model.config["context_length"]),
+                dtype=torch.long,
+                device=device        
+            ) 
+    
+    
+    
+    if pattern == "forward-only":
+        model.eval()
+        with torch.inference_mode():    
+            for i in range(warmup_steps):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+                    model(warmup_inputs[i])
+            torch.cuda.synchronize()
+
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.memory._record_memory_history(max_entries=1000000)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+                model(execution_inputs[0])
+                torch.cuda.synchronize()
+
+        peak_memory = torch.cuda.max_memory_allocated()
+        print(f"Peak memory allocated: {peak_memory / 1024 / 1024} MB")
+        torch.cuda.memory._dump_snapshot(f"../results/{model_name}_{model.config["context_length"]}_inference_memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+    
+    elif pattern == "full-training-step":
+        model.train()
+        for i in range(warmup_steps):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+                output = model(warmup_inputs[i])
+                loss = cross_entropy(output, warmup_targets[i])
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        torch.cuda.synchronize()
+        
+        del output, loss
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+            output = model(execution_inputs[0])
+            loss = cross_entropy(output, execution_targets[0])
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        peak_memory = torch.cuda.max_memory_allocated()
+        print(f"Peak memory allocated: {peak_memory / 1024 / 1024} MB")
+        torch.cuda.memory._dump_snapshot(f"../results/{model_name}_{model.config["context_length"]}_training_memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+
+def nvtx_profile(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     warmup_steps: int = 5,
-    execution_steps: int = 10
+    execution_steps: int = 10,
+    autocast: bool = False,
 ):
     batch_size = 4
     warmup_inputs = torch.randint(
@@ -97,30 +189,30 @@ def profile(
             device=device        
         )   
 
-
-    for i in range(warmup_steps):
-        optimizer.zero_grad()
-        output = model(warmup_inputs[i])
-        loss = cross_entropy(output, warmup_targets[i])
-        loss.backward()
-        optimizer.step()
-    torch.cuda.synchronize()
-    
-    with nvtx.range("benchmark_execution"):
-        for i in range(execution_steps):
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+        for i in range(warmup_steps):
             optimizer.zero_grad()
-            with nvtx.range("forward pass"):
-                output = model(execution_inputs[i])  
-            torch.cuda.synchronize()
-            
-            loss = cross_entropy(output, execution_targets[i])
-            with nvtx.range("backward pass"):
-                loss.backward()
-            torch.cuda.synchronize()
+            output = model(warmup_inputs[i])
+            loss = cross_entropy(output, warmup_targets[i])
+            loss.backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+        
+        with nvtx.range("benchmark_execution"):
+            for i in range(execution_steps):
+                optimizer.zero_grad()
+                with nvtx.range("forward pass"):
+                    output = model(execution_inputs[i])  
+                torch.cuda.synchronize()
+                
+                loss = cross_entropy(output, execution_targets[i])
+                with nvtx.range("backward pass"):
+                    loss.backward()
+                torch.cuda.synchronize()
 
-            with nvtx.range("optimizer step"):
-                optimizer.step()
-            torch.cuda.synchronize()
+                with nvtx.range("optimizer step"):
+                    optimizer.step()
+                torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
@@ -131,11 +223,17 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--d_ff", type=int, default=3072)
+    parser.add_argument("--model_name", type=str, default="model")
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--execution-steps", type=int, default=10)
+    parser.add_argument("--autocast", type=str, default="false")
+    parser.add_argument("--memory-profile", type=str, default="false")
+    parser.add_argument("--pattern", type=str, default="forward-only")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.memory_profile == "false":
+        cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     model = BasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -147,10 +245,22 @@ if __name__ == "__main__":
     model.to(device)
     optimizer = AdamW(model.parameters())
     
-    profile(
-        model=model, 
-        optimizer=optimizer,
-        device=device,
-        warmup_steps=args.warmup_steps,
-        execution_steps=args.execution_steps,
-    )
+    if args.memory_profile == "true":
+        memory_profile(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            model_name=args.model_name,
+            warmup_steps=args.warmup_steps,
+            autocast=True if args.autocast == "true" else False,
+            pattern=args.pattern,
+        )
+    else:
+        nvtx_profile(
+            model=model, 
+            optimizer=optimizer,
+            device=device,
+            warmup_steps=args.warmup_steps,
+            execution_steps=args.execution_steps,
+            autocast=True if args.autocast == "true" else False,
+        )

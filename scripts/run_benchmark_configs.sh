@@ -6,7 +6,7 @@
 #   ./run_benchmark_configs.sh [--size SIZE]... [--pattern PATTERN]
 #                               [--warmup-steps N] [--execution-steps N]
 #                               [--vocab-size N] [--context-length N]
-#                               [--repeat-times N]
+#                               [--repeat-times N] [--autocast true|false]
 #                               [-- EXTRA_BENCHMARK_ARGS]
 #
 # --size can be repeated or given as a comma-separated list; defaults to "all".
@@ -39,6 +39,7 @@ execution_steps=10
 vocab_size=10000
 context_length=512
 repeat_times=10
+autocast="True"
 extra_args=()
 
 usage() {
@@ -77,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       repeat_times="$2"
       shift 2
       ;;
+    --autocast)
+      autocast="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       ;;
@@ -96,7 +101,7 @@ if [[ ${#sizes[@]} -eq 0 || "${sizes[0]}" == "all" ]]; then
   sizes=("${ORDER[@]}")
 fi
 
-echo "Pattern=${pattern} warmup_steps=${warmup_steps} execution_steps=${execution_steps} repeat_times=${repeat_times}"
+echo "Pattern=${pattern} warmup_steps=${warmup_steps} execution_steps=${execution_steps} repeat_times=${repeat_times} autocast=${autocast}"
 echo "Sizes to run: ${sizes[*]}"
 echo
 
@@ -121,6 +126,7 @@ for size in "${sizes[@]}"; do
     --warmup-steps "$warmup_steps" \
     --execution-steps "$execution_steps" \
     --repeat-times "$repeat_times" \
+    --autocast "$autocast" \
     "${extra_args[@]}" 2>&1)
   status=$?
   set -e

@@ -15,7 +15,8 @@ def benchmark(
     device: torch.device,
     warmup_steps: int = 5,
     execution_steps: int = 10,
-    pattern: Literal["forward-only", "forward-and-backward", "full-training-step"] = "forward-only"
+    pattern: Literal["forward-only", "forward-and-backward", "full-training-step"] = "forward-only",
+    autocast: bool = True
 ):
     batch_size = 4
     warmup_inputs = torch.randint(
@@ -47,56 +48,56 @@ def benchmark(
             device=device        
         )   
 
-
-    if pattern == "forward-only":
-        for i in range(warmup_steps):
-            model(warmup_inputs[i])
-        torch.cuda.synchronize()
-        
-        start = timeit.default_timer()
-        for i in range(execution_steps):
-            model(execution_inputs[i])
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
+        if pattern == "forward-only":
+            for i in range(warmup_steps):
+                model(warmup_inputs[i])
             torch.cuda.synchronize()
-        end = timeit.default_timer()
-        return (end - start) / execution_steps
+            
+            start = timeit.default_timer()
+            for i in range(execution_steps):
+                model(execution_inputs[i])
+                torch.cuda.synchronize()
+            end = timeit.default_timer()
+            return (end - start) / execution_steps
 
-    elif pattern == "forward-and-backward":
-        for i in range(warmup_steps):
-            optimizer.zero_grad()
-            output = model(warmup_inputs[i])
-            loss = cross_entropy(output, warmup_targets[i])
-            loss.backward()
-        torch.cuda.synchronize()
-
-        start = timeit.default_timer()
-        for i in range(execution_steps):
-            optimizer.zero_grad()
-            output = model(execution_inputs[i])
-            loss = cross_entropy(output, execution_targets[i])
-            loss.backward()
+        elif pattern == "forward-and-backward":
+            for i in range(warmup_steps):
+                optimizer.zero_grad()
+                output = model(warmup_inputs[i])
+                loss = cross_entropy(output, warmup_targets[i])
+                loss.backward()
             torch.cuda.synchronize()
-        end = timeit.default_timer()
-        return (end - start) / execution_steps
 
-    elif pattern == "full-training-step":
-        for i in range(warmup_steps):
-            optimizer.zero_grad()
-            output = model(warmup_inputs[i])
-            loss = cross_entropy(output, warmup_targets[i])
-            loss.backward()
-            optimizer.step()
-        torch.cuda.synchronize()
-        
-        start = timeit.default_timer()
-        for i in range(execution_steps):
-            optimizer.zero_grad()
-            output = model(execution_inputs[i])
-            loss = cross_entropy(output, execution_targets[i])
-            loss.backward()
-            optimizer.step()
+            start = timeit.default_timer()
+            for i in range(execution_steps):
+                optimizer.zero_grad()
+                output = model(execution_inputs[i])
+                loss = cross_entropy(output, execution_targets[i])
+                loss.backward()
+                torch.cuda.synchronize()
+            end = timeit.default_timer()
+            return (end - start) / execution_steps
+
+        elif pattern == "full-training-step":
+            for i in range(warmup_steps):
+                optimizer.zero_grad()
+                output = model(warmup_inputs[i])
+                loss = cross_entropy(output, warmup_targets[i])
+                loss.backward()
+                optimizer.step()
             torch.cuda.synchronize()
-        end = timeit.default_timer()
-        return (end - start) / execution_steps
+            
+            start = timeit.default_timer()
+            for i in range(execution_steps):
+                optimizer.zero_grad()
+                output = model(execution_inputs[i])
+                loss = cross_entropy(output, execution_targets[i])
+                loss.backward()
+                optimizer.step()
+                torch.cuda.synchronize()
+            end = timeit.default_timer()
+            return (end - start) / execution_steps
 
 
 if __name__ == "__main__":
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--execution-steps", type=int, default=10)
     parser.add_argument("--repeat-times", type=int, default=10)
+    parser.add_argument("--autocast", type=str, default="true")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -134,6 +136,7 @@ if __name__ == "__main__":
             warmup_steps=args.warmup_steps,
             execution_steps=args.execution_steps,
             pattern=args.pattern,
+            autocast=True if args.autocast == "true" else False,
         ))
     avg = np.mean(lantecys)
     std = np.std(lantecys)
