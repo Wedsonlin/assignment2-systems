@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run `nsys profile` on cs336_systems/profile.py across a set of predefined
+# Run profiling on cs336_systems/nsys_profile.py across a set of predefined
 # model configs (small / medium / large / xl / 10B), matching the table from
 # the assignment handout. Profiler results are written to the project's
 # `results/` directory, named "{size}_ctx{context_length}" (nsys appends its
@@ -8,7 +8,8 @@
 # Usage:
 #   ./run_profile_configs.sh [--size SIZE]... [--context-length N]...
 #                             [--vocab-size N] [--warmup-steps N] [--execution-steps N]
-#                             [--autocast true|false] [--memory-profile true|false]
+#                             [--autocast true|false]
+#                             [--memory-profiler nvtx|pytorch|None]
 #                             [--pattern forward-only|full-training-step]
 #                             [--output-dir DIR] [--trace ARG]
 #                             [-- EXTRA_PROFILE_PY_ARGS]
@@ -17,18 +18,24 @@
 # comma-separated list. --size defaults to "all"; --context-length defaults
 # to 512.
 #
-# --memory-profile true switches nsys_profile.py into memory_profile() mode
-# (dumps a *_memory_snapshot.pickle instead of running the nvtx-annotated
-# pass). Since that mode never emits the "benchmark_execution" NVTX range and
-# nsys has nothing useful to capture, this script runs it directly via
-# `uv run python ...` (no nsys wrapper, no .nsys-rep output). Otherwise it
-# runs via `uv run nsys profile ... -- python ...` as before.
+# --memory-profiler controls how nsys_profile.py is launched:
+#   None (default): uv run nsys profile ... -- python ...
+#                   (normal nvtx_profile path; --memory-profiler is omitted so
+#                   argparse leaves it as Python None)
+#   nvtx:           same nsys wrapper, plus --cuda-memory-usage=true,
+#                   --pytorch=functions-trace-shapes,autograd-shapes-nvtx,
+#                   PYTORCH_NO_CUDA_MEMORY_CACHING=1 in the process env, and
+#                   passes --memory-profiler nvtx
+#   pytorch:        uv run python ... --memory-profiler pytorch
+#                   (PyTorch memory_profile() dumps a *_memory_snapshot.pickle;
+#                   no nsys wrapper)
 #
 # Examples:
 #   ./run_profile_configs.sh                                    # profile all sizes at ctx=512
 #   ./run_profile_configs.sh --size small --context-length 512
 #   ./run_profile_configs.sh --size small,medium --context-length 128,512
-#   ./run_profile_configs.sh --size all --memory-profile true --pattern full-training-step
+#   ./run_profile_configs.sh --size all --memory-profiler pytorch --pattern full-training-step
+#   ./run_profile_configs.sh --size small --memory-profiler nvtx
 #   ./run_profile_configs.sh --size all -- --warmup-steps 3 --execution-steps 5
 
 set -euo pipefail
@@ -53,7 +60,7 @@ execution_steps=10
 output_dir="../results"
 trace="cuda,nvtx,osrt"
 autocast="false"
-memory_profile="false"
+memory_profiler="None"
 pattern="forward-only"
 extra_args=()
 
@@ -98,8 +105,8 @@ while [[ $# -gt 0 ]]; do
       autocast="$2"
       shift 2
       ;;
-    --memory-profile)
-      memory_profile="$2"
+    --memory-profiler)
+      memory_profiler="$2"
       shift 2
       ;;
     --pattern)
@@ -128,10 +135,18 @@ if [[ ${#context_lengths[@]} -eq 0 ]]; then
   context_lengths=(512)
 fi
 
+case "$memory_profiler" in
+  None|nvtx|pytorch) ;;
+  *)
+    echo "Invalid --memory-profiler '$memory_profiler'. Valid options: None, nvtx, pytorch" >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "$output_dir"
 
 echo "vocab_size=${vocab_size} warmup_steps=${warmup_steps} execution_steps=${execution_steps} trace=${trace}"
-echo "autocast=${autocast} memory_profile=${memory_profile} pattern=${pattern}"
+echo "autocast=${autocast} memory_profiler=${memory_profiler} pattern=${pattern}"
 echo "Sizes to run: ${sizes[*]}"
 echo "Context lengths: ${context_lengths[*]}"
 echo "Output dir: ${output_dir}"
@@ -148,11 +163,6 @@ for size in "${sizes[@]}"; do
   for context_length in "${context_lengths[@]}"; do
     out_name="${size}_ctx${context_length}"
     out_path="${output_dir}/${out_name}"
-    if [[ "$memory_profile" == "true" ]]; then
-      echo "==> Profiling ${size} (ctx=${context_length}) [memory-profile mode, no nsys wrapper]"
-    else
-      echo "==> Profiling ${size} (ctx=${context_length}) -> ${out_path}"
-    fi
 
     py_args=(
       --vocab_size "$vocab_size"
@@ -165,19 +175,41 @@ for size in "${sizes[@]}"; do
       --warmup-steps "$warmup_steps"
       --execution-steps "$execution_steps"
       --autocast "$autocast"
-      --memory-profile "$memory_profile"
       --pattern "$pattern"
-      "${extra_args[@]}"
     )
+    # Omit --memory-profiler when None so argparse keeps Python None (not the
+    # string "None"). Pass the flag for nvtx / pytorch.
+    if [[ "$memory_profiler" != "None" ]]; then
+      py_args+=(--memory-profiler "$memory_profiler")
+    fi
+    py_args+=("${extra_args[@]}")
 
     set +e
-    if [[ "$memory_profile" == "true" ]]; then
-      # memory_profile() never emits the "benchmark_execution" NVTX range and
-      # just dumps a *_memory_snapshot.pickle itself, so there is nothing for
-      # nsys to usefully capture here: run the script directly instead.
+    if [[ "$memory_profiler" == "pytorch" ]]; then
+      # PyTorch memory_profile() dumps a *_memory_snapshot.pickle itself; no
+      # nsys wrapper needed.
+      echo "==> Profiling ${size} (ctx=${context_length}) [memory-profiler=pytorch, no nsys wrapper]"
       uv run python ../cs336_systems/nsys_profile.py "${py_args[@]}"
     else
-      uv run nsys profile \
+      # None / nvtx: wrap with nsys. For nvtx memory profiling, also enable
+      # CUDA memory usage tracking and PyTorch shape NVTX annotations.
+      # nsys only allows a single -e/--env-var, so set PYTORCH_NO_CUDA_MEMORY_CACHING
+      # via the shell env (inherited by the profiled process) instead of a
+      # second -e.
+      nsys_extra_opts=()
+      nsys_env=()
+      if [[ "$memory_profiler" == "nvtx" ]]; then
+        nsys_extra_opts=(
+          --cuda-memory-usage=true
+          --pytorch=functions-trace-shapes,autograd-shapes-nvtx
+        )
+        nsys_env=(env PYTORCH_NO_CUDA_MEMORY_CACHING=1)
+        echo "==> Profiling ${size} (ctx=${context_length}) [memory-profiler=nvtx] -> ${out_path}"
+      else
+        echo "==> Profiling ${size} (ctx=${context_length}) -> ${out_path}"
+      fi
+
+      "${nsys_env[@]}" uv run nsys profile \
         -o "$out_path" \
         --force-overwrite=true \
         --capture-range=nvtx \
@@ -185,6 +217,7 @@ for size in "${sizes[@]}"; do
         -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 \
         --capture-range-end=stop \
         --trace="$trace" \
+        "${nsys_extra_opts[@]}" \
         -- python ../cs336_systems/nsys_profile.py "${py_args[@]}"
     fi
     status=$?

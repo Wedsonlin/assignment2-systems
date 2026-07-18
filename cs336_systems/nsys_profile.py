@@ -10,7 +10,7 @@ from jaxtyping import Bool, Float
 from einops import einsum, rearrange
 
 import cs336_basics
-from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.model import BasicsTransformerLM, AnnotatedBasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.nn_utils import softmax
@@ -227,14 +227,14 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--execution-steps", type=int, default=10)
     parser.add_argument("--autocast", type=str, default="false")
-    parser.add_argument("--memory-profile", type=str, default="false")
+    parser.add_argument("--memory-profiler", type=str, default=None)
     parser.add_argument("--pattern", type=str, default="forward-only")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.memory_profile == "false":
+    if args.memory_profiler == None:
         cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
-    model = BasicsTransformerLM(
+    model = AnnotatedBasicsTransformerLM(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
         d_model=args.d_model,
@@ -245,7 +245,7 @@ if __name__ == "__main__":
     model.to(device)
     optimizer = AdamW(model.parameters())
     
-    if args.memory_profile == "true":
+    if args.memory_profiler == "pytorch":
         memory_profile(
             model=model,
             optimizer=optimizer,
@@ -254,6 +254,16 @@ if __name__ == "__main__":
             warmup_steps=args.warmup_steps,
             autocast=True if args.autocast == "true" else False,
             pattern=args.pattern,
+        )
+    elif args.memory_profiler == "nvtx":
+        args.execution_steps = 1
+        nvtx_profile(
+            model=model, 
+            optimizer=optimizer,
+            device=device,
+            warmup_steps=args.warmup_steps,
+            execution_steps=args.execution_steps,
+            autocast=True if args.autocast == "true" else False,
         )
     else:
         nvtx_profile(

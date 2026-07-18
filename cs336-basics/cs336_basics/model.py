@@ -530,3 +530,37 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
 def silu(x: torch.Tensor):
     return x * torch.sigmoid(x)
+
+
+import torch.cuda.nvtx as nvtx
+class AnnotatedBasicsTransformerLM(BasicsTransformerLM):
+    def forward(self, x: Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length vocab_size"]:
+        """
+        Args:
+            x: Input IDs for language modeling.
+
+        Returns: A FloatTensor of shape
+            (batch size, sequence_length, vocab_size) with the predicted unnormalized next-word
+            distribution for each token.
+        """
+        _, sequence_length = x.size()
+        # (batch size, sequence_length, d_model)
+        # NOTE: paper mentions "In the embedding layers, we multiply those
+        # weights by sqrt(d_model)", but we aren't doing that here.
+        embedded_tokens = self.token_embeddings(x)
+
+        # (batch size, sequence_length, d_model)
+        # x = self.positional_encoder(embedded_tokens, positions)
+        x = embedded_tokens
+
+        cnt = 0
+        for layer in self.layers:
+            # (batch size, sequence_length, d_model)
+            with nvtx.range(f"layer_{cnt:02d}"):
+                x = layer(x)
+            cnt += 1
+        # (batch size, sequence_length, d_model)
+        x = self.ln_final(x)
+        # (batch size, sequence_length, vocab_size)
+        logits = self.lm_head(x)
+        return logits
