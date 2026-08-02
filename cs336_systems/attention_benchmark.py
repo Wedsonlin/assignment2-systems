@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 from itertools import product
+from pathlib import Path
 
 import torch
 from triton.testing import do_bench
@@ -15,6 +16,7 @@ SEQUENCE_LENGTHS = tuple(2**power for power in range(7, 17))
 EMBEDDING_DIMS = (16, 32, 64, 128)
 BACKENDS = ("pytorch", "triton")
 MODES = ("forward", "backward", "forward_backward")
+DEFAULT_OUTPUT = Path("results/attention_benchmark.jsonl")
 
 
 def _release_cuda_memory() -> None:
@@ -32,74 +34,77 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-ms", type=int, default=25)
     parser.add_argument("--rep-ms", type=int, default=100)
     parser.add_argument("--device", type=torch.device, default=torch.device("cuda:0"))
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="JSONL path for benchmark records")
     args = parser.parse_args()
 
     torch.set_float32_matmul_precision("highest")
     torch.cuda.set_device(args.device)
 
-    configurations = product(args.seq_lens, args.dims, args.dtypes)
-    for sequence_length, embedding_dim, dtype_name in configurations:
-        dtype = torch.float32 if dtype_name == "fp32" else torch.bfloat16
-        q = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
-        k = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
-        v = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
-        d_o = torch.randn_like(q)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as output_file:
+        configurations = product(args.seq_lens, args.dims, args.dtypes)
+        for sequence_length, embedding_dim, dtype_name in configurations:
+            dtype = torch.float32 if dtype_name == "fp32" else torch.bfloat16
+            q = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+            k = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+            v = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+            d_o = torch.randn_like(q)
 
-        for backend in args.backends:
-            causal_mask = None
-            if backend == "pytorch":
-                def forward() -> torch.Tensor:
-                    return scaled_dot_product_attention(q, k, v, mask=causal_mask)
-            else:
-                def forward() -> torch.Tensor:
-                    return FlashAttentionV2Triton.apply(q, k, v, True)
+            for backend in args.backends:
+                causal_mask = None
+                if backend == "pytorch":
+                    def forward() -> torch.Tensor:
+                        return scaled_dot_product_attention(q, k, v, mask=causal_mask)
+                else:
+                    def forward() -> torch.Tensor:
+                        return FlashAttentionV2Triton.apply(q, k, v, True)
 
-            for mode in args.modes:
-                measured = None
-                output = None
-                try:
-                    if mode == "forward":
-                        measured = forward
-                    elif mode == "backward":
-                        output = forward()
-                        def measured(output: torch.Tensor = output) -> None:
-                            output.backward(d_o, retain_graph=True)
-                    else:
-                        def measured() -> None:
-                            forward().backward(d_o)
-                    mean_ms = do_bench(
-                                measured,
-                                warmup=args.warmup_ms,
-                                rep=args.rep_ms,
-                                grad_to_none=[q, k, v],
-                                return_mode="mean",
-                            )
-                    mean_ms = round(mean_ms, 3)
-                except torch.cuda.OutOfMemoryError:
-                    mean_ms = "OOM"
-                finally:
-                    for tensor in (q, k, v):
-                        tensor.grad = None
+                for mode in args.modes:
                     measured = None
                     output = None
-                    _release_cuda_memory()
+                    try:
+                        if mode == "forward":
+                            measured = forward
+                        elif mode == "backward":
+                            output = forward()
+                            def measured(output: torch.Tensor = output) -> None:
+                                output.backward(d_o, retain_graph=True)
+                        else:
+                            def measured() -> None:
+                                forward().backward(d_o)
+                        mean_ms = do_bench(
+                                    measured,
+                                    warmup=args.warmup_ms,
+                                    rep=args.rep_ms,
+                                    grad_to_none=[q, k, v],
+                                    return_mode="mean",
+                                )
+                        mean_ms = round(mean_ms, 3)
+                    except torch.cuda.OutOfMemoryError:
+                        mean_ms = "OOM"
+                    finally:
+                        for tensor in (q, k, v):
+                            tensor.grad = None
+                        measured = None
+                        output = None
+                        _release_cuda_memory()
 
-                print(
-                    json.dumps(
-                        {
-                            "seq_len": sequence_length,
-                            "d_model": embedding_dim,
-                            "precision": dtype_name,
-                            "mode": mode,
-                            "backend": backend,
-                            "mean_ms": mean_ms,
-                        }
-                    )
-                )
+                    record = {
+                        "seq_len": sequence_length,
+                        "d_model": embedding_dim,
+                        "precision": dtype_name,
+                        "mode": mode,
+                        "backend": backend,
+                        "mean_ms": mean_ms,
+                    }
+                    line = json.dumps(record)
+                    print(line)
+                    output_file.write(line + "\n")
+                    output_file.flush()
 
-            forward = None
-            causal_mask = None
+                forward = None
+                causal_mask = None
+                _release_cuda_memory()
+
+            del q, k, v, d_o
             _release_cuda_memory()
-
-        del q, k, v, d_o
-        _release_cuda_memory()
