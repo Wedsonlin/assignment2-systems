@@ -1,96 +1,105 @@
-import gc
-import timeit
-import argparse
-from itertools import product
-from typing import Callable
+from __future__ import annotations
 
-import numpy as np
+import argparse
+import gc
+import json
+from itertools import product
+
 import torch
-from einops import rearrange
+from triton.testing import do_bench
 
 from cs336_basics.model import scaled_dot_product_attention
+from cs336_systems.flash_attention import FlashAttentionV2Triton
 
-def benchmark_scaled_dot_product_attention(
-    d_model: int,
-    seq_len: int,
-    batch_size: int = 8,
-    warmup_steps: int = 10,
-    execution_steps: int = 100,
-    attention_func: Callable = scaled_dot_product_attention,
-) -> tuple[np.float64, np.float64, np.float64]:
-    torch.set_float32_matmul_precision("high")
-
-    iota = torch.arange(seq_len, device="cuda")
-    qi = rearrange(iota, "query -> query 1")
-    kj = rearrange(iota, "key   -> 1   key")
-    causal_mask = qi >= kj  # (query, key)
-    
-    for _ in range(warmup_steps):
-        Q = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-        K = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-        V = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-        attn_output = attention_func(Q, K, V, mask=causal_mask)
-        loss = attn_output.sum()
-        loss.backward()
-        torch.cuda.synchronize()
-        del attn_output, loss, Q, K, V
-
-    forward_times = []
-    backward_times = []
-    before_backward_memories = []
-    for _ in range(execution_steps):
-        Q = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-        K = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-        V = torch.randn(batch_size, seq_len, d_model, device="cuda", requires_grad=True)
-
-        torch.cuda.synchronize()
-        forward_start = timeit.default_timer()
-        attn_output = attention_func(Q, K, V, mask=causal_mask)
-        torch.cuda.synchronize()
-        forward_end = timeit.default_timer()
-        forward_times.append(forward_end - forward_start)
+SEQUENCE_LENGTHS = tuple(2**power for power in range(7, 17))
+EMBEDDING_DIMS = (16, 32, 64, 128)
+BACKENDS = ("pytorch", "triton")
+MODES = ("forward", "backward", "forward_backward")
 
 
-
-        loss = attn_output.sum()
-        torch.cuda.synchronize()
-        before_backward_memory = torch.cuda.memory_allocated(device="cuda")
-        before_backward_memories.append(before_backward_memory)
-        
-        backward_start = timeit.default_timer()
-        loss.backward()
-        torch.cuda.synchronize()
-        backward_end = timeit.default_timer()
-        backward_times.append(backward_end - backward_start)
-
-        del attn_output, loss, Q, K, V
-
-    forward_times = np.array(forward_times)
-    backward_times = np.array(backward_times)
-    before_backward_memories = np.array(before_backward_memories)
-    return forward_times.mean(), backward_times.mean(),before_backward_memories.mean()
+def _release_cuda_memory() -> None:
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--compiled", action="store_true")
+    parser = argparse.ArgumentParser(description="Benchmark PyTorch attention against Triton FlashAttention-2.")
+    parser.add_argument("--seq-lens", type=lambda value: [int(item) for item in value.split(",")], default=list(SEQUENCE_LENGTHS))
+    parser.add_argument("--dims", type=lambda value: [int(item) for item in value.split(",")], default=list(EMBEDDING_DIMS))
+    parser.add_argument("--dtypes", type=lambda value: value.lower().split(","), default=["bf16", "fp32"])
+    parser.add_argument("--backends", type=lambda value: value.lower().split(","), default=list(BACKENDS))
+    parser.add_argument("--modes", type=lambda value: value.lower().split(","), default=list(MODES))
+    parser.add_argument("--warmup-ms", type=int, default=25)
+    parser.add_argument("--rep-ms", type=int, default=100)
+    parser.add_argument("--device", type=torch.device, default=torch.device("cuda:0"))
     args = parser.parse_args()
 
-    d_models = [16, 32, 64, 128]
-    seq_lens = [256, 1024, 4096, 8192, 16384]
+    torch.set_float32_matmul_precision("highest")
+    torch.cuda.set_device(args.device)
 
-    if args.compiled:
-        attention_func = torch.compile(scaled_dot_product_attention)
-    else:
-        attention_func = scaled_dot_product_attention
+    configurations = product(args.seq_lens, args.dims, args.dtypes)
+    for sequence_length, embedding_dim, dtype_name in configurations:
+        dtype = torch.float32 if dtype_name == "fp32" else torch.bfloat16
+        q = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+        k = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+        v = torch.randn(1, sequence_length, embedding_dim, device=args.device, dtype=dtype, requires_grad=True)
+        d_o = torch.randn_like(q)
 
-    for d_model, seq_len in product(d_models, seq_lens):
-        try:
-            forward_time, backward_time, before_backward_memory = benchmark_scaled_dot_product_attention(d_model, seq_len, attention_func=attention_func)
-        except torch.cuda.OutOfMemoryError:
-            print(f"Out of memory error for d_model: {d_model}, seq_len: {seq_len}")
-        else:
-            print(f"d_model: {d_model}, seq_len: {seq_len}, forward_time: {forward_time*1000:.3f} ms, backward_time: {backward_time*1000:.3f} ms, before_backward_memory: {before_backward_memory / 1024 / 1024:.3f} MiB")
-    
-        gc.collect()
-        torch.cuda.empty_cache()
+        for backend in args.backends:
+            causal_mask = None
+            if backend == "pytorch":
+                def forward() -> torch.Tensor:
+                    return scaled_dot_product_attention(q, k, v, mask=causal_mask)
+            else:
+                def forward() -> torch.Tensor:
+                    return FlashAttentionV2Triton.apply(q, k, v, True)
+
+            for mode in args.modes:
+                measured = None
+                output = None
+                try:
+                    if mode == "forward":
+                        measured = forward
+                    elif mode == "backward":
+                        output = forward()
+                        def measured(output: torch.Tensor = output) -> None:
+                            output.backward(d_o, retain_graph=True)
+                    else:
+                        def measured() -> None:
+                            forward().backward(d_o)
+                    mean_ms = do_bench(
+                                measured,
+                                warmup=args.warmup_ms,
+                                rep=args.rep_ms,
+                                grad_to_none=[q, k, v],
+                                return_mode="mean",
+                            )
+                    mean_ms = round(mean_ms, 3)
+                except torch.cuda.OutOfMemoryError:
+                    mean_ms = "OOM"
+                finally:
+                    for tensor in (q, k, v):
+                        tensor.grad = None
+                    measured = None
+                    output = None
+                    _release_cuda_memory()
+
+                print(
+                    json.dumps(
+                        {
+                            "seq_len": sequence_length,
+                            "d_model": embedding_dim,
+                            "precision": dtype_name,
+                            "mode": mode,
+                            "backend": backend,
+                            "mean_ms": mean_ms,
+                        }
+                    )
+                )
+
+            forward = None
+            causal_mask = None
+            _release_cuda_memory()
+
+        del q, k, v, d_o
+        _release_cuda_memory()
