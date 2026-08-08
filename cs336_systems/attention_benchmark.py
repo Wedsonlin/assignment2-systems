@@ -144,6 +144,9 @@ def _run_vanilla_suite(
 ) -> None:
     backend = "compile" if suite == "torch_compile" else "pytorch"
     compiled_attn = torch.compile(scaled_dot_product_attention) if backend == "compile" else None
+    # torch.compile + retain_graph=True conflicts with donated buffers.
+    if backend == "compile":
+        torch._functorch.config.donated_buffer = False
 
     for sequence_length, embedding_dim, dtype_name in product(seq_lens, dims, dtypes):
         dtype = _dtype_from_name(dtype_name)
