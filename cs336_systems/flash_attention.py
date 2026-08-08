@@ -44,10 +44,40 @@ def pytorch_backward(ctx, d_o):
 TRITON_FORWARD_CONFIGS = [
     triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_warps=4, num_stages=2),
     triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 16}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
     triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=8, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
     triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=4, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=4, num_stages=3),
     triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
     triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 32}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 128}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 128}, num_warps=8, num_stages=3),
+]
+
+# Backward uses more SRAM than forward; keep small tiles as fallbacks and include
+# larger ones for high-SRAM GPUs (A100/H100/B200). Autotune drops configs that
+# exceed shared memory on the current device.
+TRITON_BACKWARD_CONFIGS = [
+    triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 16}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 16}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 16, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 32}, num_warps=8, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 32}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=4, num_stages=2),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 32}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 32, "K_TILE_SIZE": 128}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 128, "K_TILE_SIZE": 64}, num_warps=8, num_stages=3),
+    triton.Config({"Q_TILE_SIZE": 64, "K_TILE_SIZE": 128}, num_warps=8, num_stages=3),
 ]
 
 
@@ -192,6 +222,11 @@ def flash_fwd_kernel(
     tl.store(O_block_ptr, o, boundary_check=(0, 1))
     tl.store(L_block_ptr, logsumexp, boundary_check=(0,))
 
+@triton.autotune(
+    configs=TRITON_BACKWARD_CONFIGS,
+    key=["N_KEYS", "D", "is_causal", "FLOAT32"],
+    cache_results=True,
+)
 @triton.jit
 def flash_bwd_dkdv_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -208,6 +243,7 @@ def flash_bwd_dkdv_kernel(
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
+    FLOAT32: tl.constexpr,
 ):
     # Program indices, it's common to put main parallel dimension first
     key_tile_index = tl.program_id(0)
@@ -328,6 +364,11 @@ def flash_bwd_dkdv_kernel(
     tl.store(dV_block_ptr, dv, boundary_check=(0, 1))
 
 
+@triton.autotune(
+    configs=TRITON_BACKWARD_CONFIGS,
+    key=["N_QUERIES", "D", "is_causal", "FLOAT32"],
+    cache_results=True,
+)
 @triton.jit
 def flash_bwd_dq_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -343,7 +384,8 @@ def flash_bwd_dq_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    is_causal: tl.constexpr,    
+    is_causal: tl.constexpr,
+    FLOAT32: tl.constexpr,
 ):
 
     # Program indices, it's common to put main parallel dimension first
@@ -500,13 +542,13 @@ class FlashAttentionV2Triton(torch.autograd.Function):
         D = (O.float() * dO.float()).sum(dim=-1)
         dK, dV = torch.empty_like(K), torch.empty_like(V)
         dQ = torch.empty_like(Q)
+        float32 = Q.dtype == torch.float32
 
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 32
         def grid_dkdv(meta):
-            return triton.cdiv(N_k, K_TILE_SIZE), b
+            return triton.cdiv(N_k, meta["K_TILE_SIZE"]), b
+
         def grid_dq(meta):
-            return triton.cdiv(N_q, Q_TILE_SIZE), b
+            return triton.cdiv(N_q, meta["Q_TILE_SIZE"]), b
 
         flash_bwd_dkdv_kernel[grid_dkdv](
             Q, K, V,
@@ -520,8 +562,8 @@ class FlashAttentionV2Triton(torch.autograd.Function):
             N_q, N_k,
             scale,
             d_model,
-            Q_TILE_SIZE, K_TILE_SIZE,
             is_causal=is_causal,
+            FLOAT32=float32,
         )
 
         flash_bwd_dq_kernel[grid_dq](
@@ -536,8 +578,8 @@ class FlashAttentionV2Triton(torch.autograd.Function):
             N_q, N_k,
             scale,
             d_model,
-            Q_TILE_SIZE, K_TILE_SIZE,
             is_causal=is_causal,
+            FLOAT32=float32,
         )
 
         return dQ, dK, dV, None
