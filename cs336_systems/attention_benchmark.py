@@ -312,7 +312,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iters for vanilla/compile suites")
     parser.add_argument("--iters", type=int, default=100, help="Timed iters for vanilla/compile suites")
     parser.add_argument("--warmup-ms", type=int, default=2000, help="do_bench warmup ms for flash suite (large enough to absorb Triton autotune)")
-    parser.add_argument("--rep-ms", type=int, default=100, help="do_bench rep ms for flash suite")
+    parser.add_argument("--rep-ms", type=int, default=5000, help="do_bench rep ms for flash suite")
     parser.add_argument("--device", type=torch.device, default=torch.device("cuda:0"))
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
