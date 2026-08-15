@@ -107,8 +107,7 @@ def benchmark_ddp(
         # d_ff=3072,
         # num_layers=12,
         # num_heads=12,
-    )
-    model = model.to(device)
+    ).to(device)
     ddp_model = ddp(model)
 
     optimizer = torch.optim.Adam(ddp_model.parameters(), lr=0.001)
@@ -152,8 +151,8 @@ def benchmark_ddp(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--world-size", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--backend", type=str, default="gloo")
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--backend", type=str, default="nccl")
     args = parser.parse_args()
     mp.spawn(
         benchmark_ddp,
