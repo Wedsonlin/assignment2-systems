@@ -5,6 +5,7 @@ import timeit
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
@@ -24,6 +25,7 @@ class NaiveDDP(torch.nn.Module):
     def forward(self, *inputs, **kwargs):
         return self.module(*inputs, **kwargs)
 
+    @nvtx.range("gradient_synchronization")
     def finish_gradient_synchronization(self):
         """"
             Naive DDP implementation.
@@ -49,6 +51,7 @@ class OptimizedDDP(NaiveDDP):
             if param.requires_grad:
                 param.register_post_accumulate_grad_hook(self._reduce_gradient)
 
+    @nvtx.range("gradient_synchronization")
     def _reduce_gradient(self, param: torch.nn.Parameter):
         handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
         self.handles.append(handle)
@@ -97,10 +100,12 @@ def ddp_train(
         if device != "cpu":
             torch.cuda.synchronize()
         start_training_time = timeit.default_timer()
-        loss = cross_entropy(ddp_model(x), y)
+        with nvtx.range("forward"):
+            loss = cross_entropy(ddp_model(x), y)
         optimizer.zero_grad()
-        loss.backward()
-
+        with nvtx.range("backward"):
+            loss.backward()
+        
         if device != "cpu":
             torch.cuda.synchronize()
         start_communication_time = timeit.default_timer()
