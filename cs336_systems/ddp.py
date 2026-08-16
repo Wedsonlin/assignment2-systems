@@ -25,10 +25,42 @@ class NaiveDDP(torch.nn.Module):
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self):
-        # average gradients across all ranks
+        """"
+            Naive DDP implementation.
+            Average gradients across all ranks.
+        """
+        # for param in self.module.parameters():
+        #     if param.grad is not None:
+        #         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        
+        grads_list = [param.grad for param in self.module.parameters() if param.grad is not None]
+        flattened_grads = torch._utils._flatten_dense_tensors(grads_list)
+        dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG)
+        unflattened_grads = torch._utils._unflatten_dense_tensors(flattened_grads, grads_list)
+        for dst, src in zip(grads_list, unflattened_grads):
+            dst.copy_(src)
+
+class OptimizedDDP(NaiveDDP):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__(module)
+        self.handles = []
+
         for param in self.module.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(self._reduce_gradient)
+
+    def _reduce_gradient(self, param: torch.nn.Parameter):
+        handle = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
+        self.handles.append(handle)
+
+    def finish_gradient_synchronization(self):
+        """
+            Optimized DDP implementation.
+            Reduce gradients across all ranks.
+        """
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
 
 def setup_process_group(rank, world_size, backend):
     os.environ["MASTER_ADDR"] = "localhost"
@@ -95,18 +127,18 @@ def benchmark_ddp(
     ):
     device = setup_process_group(rank=rank, world_size=world_size, backend=backend)
     model = BasicsTransformerLM(
-        vocab_size=10000,
-        context_length=512,
-        d_model=2560,
-        d_ff=10240,
-        num_layers=32,
-        num_heads=32,
         # vocab_size=10000,
-        # context_length=128,
-        # d_model=768,
-        # d_ff=3072,
-        # num_layers=12,
-        # num_heads=12,
+        # context_length=512,
+        # d_model=2560,
+        # d_ff=10240,
+        # num_layers=32,
+        # num_heads=32,
+        vocab_size=10000,
+        context_length=128,
+        d_model=768,
+        d_ff=3072,
+        num_layers=12,
+        num_heads=12,
     ).to(device)
     ddp_model = ddp(model)
 
@@ -153,10 +185,12 @@ if __name__ == "__main__":
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--optimized", action="store_true")
     args = parser.parse_args()
+    ddp = OptimizedDDP if args.optimized else NaiveDDP
     mp.spawn(
         benchmark_ddp,
-        args=(NaiveDDP, args.world_size, args.backend, args.batch_size),
+        args=(ddp, args.world_size, args.backend, args.batch_size),
         nprocs=args.world_size,
         join=True,
     )
