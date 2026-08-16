@@ -31,16 +31,16 @@ class NaiveDDP(torch.nn.Module):
             Naive DDP implementation.
             Average gradients across all ranks.
         """
-        # for param in self.module.parameters():
-        #     if param.grad is not None:
-        #         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        for param in self.module.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
         
-        grads_list = [param.grad for param in self.module.parameters() if param.grad is not None]
-        flattened_grads = torch._utils._flatten_dense_tensors(grads_list)
-        dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG)
-        unflattened_grads = torch._utils._unflatten_dense_tensors(flattened_grads, grads_list)
-        for dst, src in zip(grads_list, unflattened_grads):
-            dst.copy_(src)
+        # grads_list = [param.grad for param in self.module.parameters() if param.grad is not None]
+        # flattened_grads = torch._utils._flatten_dense_tensors(grads_list)
+        # dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG)
+        # unflattened_grads = torch._utils._unflatten_dense_tensors(flattened_grads, grads_list)
+        # for dst, src in zip(grads_list, unflattened_grads):
+        #     dst.copy_(src)
 
 class OptimizedDDP(NaiveDDP):
     def __init__(self, module: torch.nn.Module):
@@ -132,18 +132,18 @@ def benchmark_ddp(
     ):
     device = setup_process_group(rank=rank, world_size=world_size, backend=backend)
     model = BasicsTransformerLM(
-        # vocab_size=10000,
-        # context_length=512,
-        # d_model=2560,
-        # d_ff=10240,
-        # num_layers=32,
-        # num_heads=32,
         vocab_size=10000,
-        context_length=128,
-        d_model=768,
-        d_ff=3072,
-        num_layers=12,
-        num_heads=12,
+        context_length=512,
+        d_model=2560,
+        d_ff=10240,
+        num_layers=32,
+        num_heads=32,
+        # vocab_size=10000,
+        # context_length=128,
+        # d_model=768,
+        # d_ff=3072,
+        # num_layers=12,
+        # num_heads=12,
     ).to(device)
     ddp_model = ddp(model)
 
