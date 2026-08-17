@@ -97,9 +97,14 @@ def memory_snapshot(model, optimizer=None):
     return {key: round(value, 3) for key, value in result.items()}
 
 
-def train_step(model, optimizer, inputs, targets):
+def compute_loss(model, inputs, targets, mixed_precision: bool):
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=mixed_precision):
+        return cross_entropy(model(inputs), targets)
+
+
+def train_step(model, optimizer, inputs, targets, mixed_precision: bool):
     optimizer.zero_grad(set_to_none=True)
-    loss = cross_entropy(model(inputs), targets)
+    loss = compute_loss(model, inputs, targets, mixed_precision)
     loss.backward()
     model.finish_gradient_synchronization()
     optimizer.step()
@@ -139,7 +144,7 @@ def run_experiment(rank, args):
         targets = torch.randint(args.vocab_size, (local_batch_size, args.context_length), device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = cross_entropy(model(inputs), targets)
+        loss = compute_loss(model, inputs, targets, args.mixed_precision)
         loss.backward()
         model.finish_gradient_synchronization()
         memory["before_optimizer_step"] = memory_snapshot(model, optimizer)
@@ -148,12 +153,12 @@ def run_experiment(rank, args):
         del loss
 
         for _ in range(args.warmup_steps):
-            train_step(model, optimizer, inputs, targets)
+            train_step(model, optimizer, inputs, targets, args.mixed_precision)
         dist.barrier()
         torch.cuda.synchronize()
         start = timeit.default_timer()
         for _ in range(args.steps):
-            train_step(model, optimizer, inputs, targets)
+            train_step(model, optimizer, inputs, targets, args.mixed_precision)
         torch.cuda.synchronize()
         iteration_ms = torch.tensor((timeit.default_timer() - start) * 1000 / args.steps, device=device)
         dist.all_reduce(iteration_ms, op=dist.ReduceOp.MAX)
@@ -162,6 +167,8 @@ def run_experiment(rank, args):
             results.append(
                 {
                     "mode": "sharded" if sharded else "baseline",
+                    "mixed_precision": args.mixed_precision,
+                    "compute_dtype": "bf16" if args.mixed_precision else "fp32",
                     "num_parameters": sum(p.numel() for p in model.parameters()),
                     "memory": memory,
                     "iteration_ms": round(iteration_ms.item(), 3),
@@ -196,8 +203,9 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--master-port", type=int, default=12391)
-    parser.add_argument("--output", default="results/sharded_optimizer.json")
+    parser.add_argument("--output", default="results/sharded_optimizer_bf16.json")
     args = parser.parse_args()
     mp.spawn(run_experiment, args=(args,), nprocs=args.world_size, join=True)
 
