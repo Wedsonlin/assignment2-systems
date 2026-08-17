@@ -1,0 +1,206 @@
+import argparse
+import gc
+import json
+import os
+import timeit
+from pathlib import Path
+from typing import Type
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.optim import Optimizer
+
+from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import cross_entropy
+from cs336_systems.ddp import OptimizedDDP
+
+
+class ShardedOptimizer(Optimizer):
+    @torch.no_grad()
+    def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs):
+        self.list_params = []
+        ids = set()
+        for p in params:
+            if id(p) not in ids and p.requires_grad:
+                self.list_params.append(p)
+                ids.add(id(p))
+
+        n_params = sum(p.numel() for p in self.list_params)
+        self.flatten_buffer = torch.empty(n_params, dtype=self.list_params[0].dtype, device=self.list_params[0].device)
+        offest = 0
+        for p in self.list_params:
+            self.flatten_buffer[offest:offest+p.numel()].copy_(p.data.view(-1))
+            p.set_(self.flatten_buffer[offest:offest+p.numel()].view_as(p))
+            offest += p.numel()
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        offset_per_rank = n_params // world_size # rquire n_params % world_size == 0
+        self.start = rank * offset_per_rank
+        self.end = self.start + offset_per_rank
+        self.shard = self.flatten_buffer[self.start:self.end]
+
+        super().__init__(self.list_params, defaults={})
+        self.optimizer = optimizer_cls([self.shard], **kwargs)
+
+    def step(self, closure=None, **kwargs):
+        offset = 0
+        self.shard.grad = torch.zeros_like(self.shard)
+        for p in self.list_params:
+            if p.grad is None:
+                offset += p.numel()
+                continue
+            start = max(offset, self.start)
+            end  = min(offset + p.numel(), self.end)
+            if start < end:
+                self.shard.grad[start-self.start:end-self.start] = p.grad.view(-1)[start-offset:end-offset]
+            offset += p.numel()
+
+        self.optimizer.step(closure, **kwargs)
+        new_flatten_buffer = torch.empty_like(self.flatten_buffer)
+        dist.all_gather_into_tensor(new_flatten_buffer, self.shard)
+        self.flatten_buffer.copy_(new_flatten_buffer)
+
+
+GIB = 1024**3
+
+
+def memory_snapshot(model, optimizer=None):
+    torch.cuda.synchronize()
+    parameters = sum(p.numel() * p.element_size() for p in model.parameters())
+    gradients = sum(p.grad.numel() * p.grad.element_size() for p in model.parameters() if p.grad is not None)
+    inner_optimizer = optimizer.optimizer if isinstance(optimizer, ShardedOptimizer) else optimizer
+    optimizer_states = 0 if inner_optimizer is None else sum(
+        value.numel() * value.element_size()
+        for state in inner_optimizer.state.values()
+        for value in state.values()
+        if torch.is_tensor(value)
+    )
+    shard_gradient = (
+        optimizer.shard.grad.numel() * optimizer.shard.grad.element_size()
+        if isinstance(optimizer, ShardedOptimizer) and optimizer.shard.grad is not None
+        else 0
+    )
+    allocated = torch.cuda.memory_allocated()
+    result = {
+        "allocated_gib": allocated / GIB,
+        "phase_peak_gib": torch.cuda.max_memory_allocated() / GIB,
+        "parameters_gib": parameters / GIB,
+        "gradients_gib": gradients / GIB,
+        "optimizer_states_gib": optimizer_states / GIB,
+        "shard_gradient_gib": shard_gradient / GIB,
+        "other_gib": (allocated - parameters - gradients - optimizer_states - shard_gradient) / GIB,
+    }
+    torch.cuda.reset_peak_memory_stats()
+    return {key: round(value, 3) for key, value in result.items()}
+
+
+def train_step(model, optimizer, inputs, targets):
+    optimizer.zero_grad(set_to_none=True)
+    loss = cross_entropy(model(inputs), targets)
+    loss.backward()
+    model.finish_gradient_synchronization()
+    optimizer.step()
+
+
+def run_experiment(rank, args):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(args.master_port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=args.world_size)
+    device = torch.device("cuda", rank)
+    local_batch_size = args.batch_size // args.world_size
+    modes = [False, True] if args.mode == "both" else [args.mode == "sharded"]
+    results = []
+
+    for sharded in modes:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        model = BasicsTransformerLM(
+            vocab_size=args.vocab_size,
+            context_length=args.context_length,
+            d_model=args.d_model,
+            d_ff=args.d_ff,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+        ).to(device)
+        model = OptimizedDDP(model)
+        memory = {"after_model_init": memory_snapshot(model)}
+
+        optimizer_cls = torch.optim.AdamW
+        optimizer = (
+            ShardedOptimizer(model.parameters(), optimizer_cls, lr=args.lr, foreach=False)
+            if sharded
+            else optimizer_cls(model.parameters(), lr=args.lr, foreach=False)
+        )
+        inputs = torch.randint(args.vocab_size, (local_batch_size, args.context_length), device=device)
+        targets = torch.randint(args.vocab_size, (local_batch_size, args.context_length), device=device)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss = cross_entropy(model(inputs), targets)
+        loss.backward()
+        model.finish_gradient_synchronization()
+        memory["before_optimizer_step"] = memory_snapshot(model, optimizer)
+        optimizer.step()
+        memory["after_optimizer_step"] = memory_snapshot(model, optimizer)
+        del loss
+
+        for _ in range(args.warmup_steps):
+            train_step(model, optimizer, inputs, targets)
+        dist.barrier()
+        torch.cuda.synchronize()
+        start = timeit.default_timer()
+        for _ in range(args.steps):
+            train_step(model, optimizer, inputs, targets)
+        torch.cuda.synchronize()
+        iteration_ms = torch.tensor((timeit.default_timer() - start) * 1000 / args.steps, device=device)
+        dist.all_reduce(iteration_ms, op=dist.ReduceOp.MAX)
+
+        if rank == 0:
+            results.append(
+                {
+                    "mode": "sharded" if sharded else "baseline",
+                    "num_parameters": sum(p.numel() for p in model.parameters()),
+                    "memory": memory,
+                    "iteration_ms": round(iteration_ms.item(), 3),
+                }
+            )
+
+        del inputs, targets, optimizer, model
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+    if rank == 0:
+        output = json.dumps({"config": vars(args), "results": results}, indent=2)
+        print(output)
+        output_path = Path(__file__).resolve().parents[1] / args.output
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output + "\n", encoding="utf-8")
+    dist.destroy_process_group()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Profile optimizer-state sharding memory and iteration time.")
+    parser.add_argument("--mode", choices=("both", "baseline", "sharded"), default="both")
+    parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--vocab-size", type=int, default=10_000)
+    parser.add_argument("--context-length", type=int, default=512)
+    parser.add_argument("--d-model", type=int, default=2560)
+    parser.add_argument("--d-ff", type=int, default=10240)
+    parser.add_argument("--num-layers", type=int, default=32)
+    parser.add_argument("--num-heads", type=int, default=32)
+    parser.add_argument("--warmup-steps", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--master-port", type=int, default=12391)
+    parser.add_argument("--output", default="results/sharded_optimizer.json")
+    args = parser.parse_args()
+    mp.spawn(run_experiment, args=(args,), nprocs=args.world_size, join=True)
+
+
+if __name__ == "__main__":
+    main()
+
