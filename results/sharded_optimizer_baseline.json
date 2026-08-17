@@ -12,12 +12,15 @@
     "warmup_steps": 5,
     "steps": 10,
     "lr": 0.001,
+    "mixed_precision": true,
     "master_port": 12391,
     "output": "results/sharded_optimizer_baseline.json"
   },
   "results": [
     {
       "mode": "baseline",
+      "mixed_precision": true,
+      "compute_dtype": "bf16",
       "num_parameters": 3406809600,
       "memory": {
         "after_model_init": {
@@ -31,7 +34,7 @@
         },
         "before_optimizer_step": {
           "allocated_gib": 25.572,
-          "phase_peak_gib": 26.713,
+          "phase_peak_gib": 28.344,
           "parameters_gib": 12.691,
           "gradients_gib": 12.691,
           "optimizer_states_gib": 0.0,
@@ -39,16 +42,16 @@
           "other_gib": 0.189
         },
         "after_optimizer_step": {
-          "allocated_gib": 50.984,
-          "phase_peak_gib": 51.277,
+          "allocated_gib": 51.008,
+          "phase_peak_gib": 51.301,
           "parameters_gib": 12.691,
           "gradients_gib": 12.691,
           "optimizer_states_gib": 25.383,
           "shard_gradient_gib": 0.0,
-          "other_gib": 0.218
+          "other_gib": 0.243
         }
       },
-      "iteration_ms": 638.21
+      "iteration_ms": 228.395
     }
   ]
 }
