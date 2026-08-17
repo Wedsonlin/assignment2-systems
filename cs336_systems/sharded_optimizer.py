@@ -58,9 +58,10 @@ class ShardedOptimizer(Optimizer):
             offset += p.numel()
 
         self.optimizer.step(closure, **kwargs)
-        new_flatten_buffer = torch.empty_like(self.flatten_buffer)
-        dist.all_gather_into_tensor(new_flatten_buffer, self.shard)
-        self.flatten_buffer.copy_(new_flatten_buffer)
+        self.shard.grad = None
+        updated_shard = self.shard.clone()
+        dist.all_gather_into_tensor(self.flatten_buffer, updated_shard)
+        del updated_shard
 
 
 GIB = 1024**3

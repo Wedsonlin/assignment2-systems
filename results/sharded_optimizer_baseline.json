@@ -1,0 +1,54 @@
+{
+  "config": {
+    "mode": "baseline",
+    "world_size": 2,
+    "batch_size": 4,
+    "vocab_size": 10000,
+    "context_length": 512,
+    "d_model": 2560,
+    "d_ff": 10240,
+    "num_layers": 32,
+    "num_heads": 32,
+    "warmup_steps": 5,
+    "steps": 10,
+    "lr": 0.001,
+    "master_port": 12391,
+    "output": "results/sharded_optimizer_baseline.json"
+  },
+  "results": [
+    {
+      "mode": "baseline",
+      "num_parameters": 3406809600,
+      "memory": {
+        "after_model_init": {
+          "allocated_gib": 12.817,
+          "phase_peak_gib": 12.817,
+          "parameters_gib": 12.691,
+          "gradients_gib": 0.0,
+          "optimizer_states_gib": 0.0,
+          "shard_gradient_gib": 0.0,
+          "other_gib": 0.126
+        },
+        "before_optimizer_step": {
+          "allocated_gib": 25.572,
+          "phase_peak_gib": 26.713,
+          "parameters_gib": 12.691,
+          "gradients_gib": 12.691,
+          "optimizer_states_gib": 0.0,
+          "shard_gradient_gib": 0.0,
+          "other_gib": 0.189
+        },
+        "after_optimizer_step": {
+          "allocated_gib": 50.984,
+          "phase_peak_gib": 51.277,
+          "parameters_gib": 12.691,
+          "gradients_gib": 12.691,
+          "optimizer_states_gib": 25.383,
+          "shard_gradient_gib": 0.0,
+          "other_gib": 0.218
+        }
+      },
+      "iteration_ms": 638.21
+    }
+  ]
+}
