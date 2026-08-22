@@ -28,6 +28,7 @@ class ShardedOptimizer(Optimizer):
 
         n_params = sum(p.numel() for p in self.list_params)
         self.flatten_buffer = torch.empty(n_params, dtype=self.list_params[0].dtype, device=self.list_params[0].device)
+
         offest = 0
         for p in self.list_params:
             self.flatten_buffer[offest:offest+p.numel()].copy_(p.data.view(-1))
@@ -41,27 +42,36 @@ class ShardedOptimizer(Optimizer):
         self.end = self.start + offset_per_rank
         self.shard = self.flatten_buffer[self.start:self.end]
 
-        super().__init__(self.list_params, defaults={})
-        self.optimizer = optimizer_cls([self.shard], **kwargs)
-
-    def step(self, closure=None, **kwargs):
+        self.local_params = []
+        self.local_mappings = []
         offset = 0
-        self.shard.grad = torch.zeros_like(self.shard)
         for p in self.list_params:
-            if p.grad is None:
-                offset += p.numel()
-                continue
-            start = max(offset, self.start)
-            end  = min(offset + p.numel(), self.end)
-            if start < end:
-                self.shard.grad[start-self.start:end-self.start] = p.grad.view(-1)[start-offset:end-offset]
+            global_start = max(offset, self.start)
+            global_end  = min(offset + p.numel(), self.end)
+            if global_start < global_end:
+                local_param = self.flatten_buffer[global_start:global_end]
+                local_start = global_start - offset
+                local_end = global_end - offset
+
+                self.local_params.append(local_param)
+                self.local_mappings.append(
+                    (local_param, p, local_start, local_end)
+                )
             offset += p.numel()
 
+        super().__init__(self.list_params, defaults={})
+        self.optimizer = optimizer_cls(self.local_params, **kwargs)
+
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none)
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def step(self, closure=None, **kwargs):
+        for local_param, p, start, end in self.local_mappings:
+            local_param.grad = p.grad.view(-1)[start:end]
+
         self.optimizer.step(closure, **kwargs)
-        self.shard.grad = None
-        updated_shard = self.shard.clone()
-        dist.all_gather_into_tensor(self.flatten_buffer, updated_shard)
-        del updated_shard
+        dist.all_gather_into_tensor(self.flatten_buffer, self.shard)
 
 
 GIB = 1024**3
@@ -78,11 +88,6 @@ def memory_snapshot(model, optimizer=None):
         for value in state.values()
         if torch.is_tensor(value)
     )
-    shard_gradient = (
-        optimizer.shard.grad.numel() * optimizer.shard.grad.element_size()
-        if isinstance(optimizer, ShardedOptimizer) and optimizer.shard.grad is not None
-        else 0
-    )
     allocated = torch.cuda.memory_allocated()
     result = {
         "allocated_gib": allocated / GIB,
@@ -90,8 +95,7 @@ def memory_snapshot(model, optimizer=None):
         "parameters_gib": parameters / GIB,
         "gradients_gib": gradients / GIB,
         "optimizer_states_gib": optimizer_states / GIB,
-        "shard_gradient_gib": shard_gradient / GIB,
-        "other_gib": (allocated - parameters - gradients - optimizer_states - shard_gradient) / GIB,
+        "other_gib": (allocated - parameters - gradients - optimizer_states) / GIB,
     }
     torch.cuda.reset_peak_memory_stats()
     return {key: round(value, 3) for key, value in result.items()}
@@ -163,14 +167,38 @@ def run_experiment(rank, args):
         iteration_ms = torch.tensor((timeit.default_timer() - start) * 1000 / args.steps, device=device)
         dist.all_reduce(iteration_ms, op=dist.ReduceOp.MAX)
 
+        memory_per_rank = [None] * args.world_size if rank == 0 else None
+        dist.gather_object({"rank": rank, "phases": memory}, memory_per_rank, dst=0)
+
         if rank == 0:
+            max_phase_peaks = {}
+            for phase in memory:
+                worst = max(
+                    memory_per_rank,
+                    key=lambda item: item["phases"][phase]["phase_peak_gib"],
+                )
+                max_phase_peaks[phase] = {
+                    "rank": worst["rank"],
+                    "phase_peak_gib": worst["phases"][phase]["phase_peak_gib"],
+                }
+            run_peak_phase = max(
+                max_phase_peaks,
+                key=lambda phase: max_phase_peaks[phase]["phase_peak_gib"],
+            )
             results.append(
                 {
                     "mode": "sharded" if sharded else "baseline",
                     "mixed_precision": args.mixed_precision,
                     "compute_dtype": "bf16" if args.mixed_precision else "fp32",
                     "num_parameters": sum(p.numel() for p in model.parameters()),
-                    "memory": memory,
+                    "memory": {
+                        "per_rank": memory_per_rank,
+                        "max_phase_peaks": max_phase_peaks,
+                        "run_peak": {
+                            "phase": run_peak_phase,
+                            **max_phase_peaks[run_peak_phase],
+                        },
+                    },
                     "iteration_ms": round(iteration_ms.item(), 3),
                 }
             )
@@ -205,7 +233,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--master-port", type=int, default=12391)
-    parser.add_argument("--output", default="results/sharded_optimizer_bf16.json")
+    parser.add_argument("--output", default="results/sharded_optimizer.json")
     args = parser.parse_args()
     mp.spawn(run_experiment, args=(args,), nprocs=args.world_size, join=True)
 
