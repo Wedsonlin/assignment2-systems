@@ -23,35 +23,87 @@
       "compute_dtype": "bf16",
       "num_parameters": 3406809600,
       "memory": {
-        "after_model_init": {
-          "allocated_gib": 12.817,
-          "phase_peak_gib": 12.817,
-          "parameters_gib": 12.691,
-          "gradients_gib": 0.0,
-          "optimizer_states_gib": 0.0,
-          "shard_gradient_gib": 0.0,
-          "other_gib": 0.126
+        "per_rank": [
+          {
+            "rank": 0,
+            "phases": {
+              "after_model_init": {
+                "allocated_gib": 12.817,
+                "phase_peak_gib": 12.817,
+                "parameters_gib": 12.691,
+                "gradients_gib": 0.0,
+                "optimizer_states_gib": 0.0,
+                "other_gib": 0.126
+              },
+              "before_optimizer_step": {
+                "allocated_gib": 25.498,
+                "phase_peak_gib": 28.319,
+                "parameters_gib": 12.691,
+                "gradients_gib": 12.691,
+                "optimizer_states_gib": 0.0,
+                "other_gib": 0.115
+              },
+              "after_optimizer_step": {
+                "allocated_gib": 38.269,
+                "phase_peak_gib": 38.562,
+                "parameters_gib": 12.691,
+                "gradients_gib": 12.691,
+                "optimizer_states_gib": 12.691,
+                "other_gib": 0.195
+              }
+            }
+          },
+          {
+            "rank": 1,
+            "phases": {
+              "after_model_init": {
+                "allocated_gib": 12.817,
+                "phase_peak_gib": 12.817,
+                "parameters_gib": 12.691,
+                "gradients_gib": 0.0,
+                "optimizer_states_gib": 0.0,
+                "other_gib": 0.126
+              },
+              "before_optimizer_step": {
+                "allocated_gib": 25.498,
+                "phase_peak_gib": 28.319,
+                "parameters_gib": 12.691,
+                "gradients_gib": 12.691,
+                "optimizer_states_gib": 0.0,
+                "other_gib": 0.115
+              },
+              "after_optimizer_step": {
+                "allocated_gib": 38.265,
+                "phase_peak_gib": 38.558,
+                "parameters_gib": 12.691,
+                "gradients_gib": 12.691,
+                "optimizer_states_gib": 12.691,
+                "other_gib": 0.191
+              }
+            }
+          }
+        ],
+        "max_phase_peaks": {
+          "after_model_init": {
+            "rank": 0,
+            "phase_peak_gib": 12.817
+          },
+          "before_optimizer_step": {
+            "rank": 0,
+            "phase_peak_gib": 28.319
+          },
+          "after_optimizer_step": {
+            "rank": 0,
+            "phase_peak_gib": 38.562
+          }
         },
-        "before_optimizer_step": {
-          "allocated_gib": 25.498,
-          "phase_peak_gib": 28.319,
-          "parameters_gib": 12.691,
-          "gradients_gib": 12.691,
-          "optimizer_states_gib": 0.0,
-          "shard_gradient_gib": 0.0,
-          "other_gib": 0.115
-        },
-        "after_optimizer_step": {
-          "allocated_gib": 38.189,
-          "phase_peak_gib": 57.226,
-          "parameters_gib": 12.691,
-          "gradients_gib": 12.691,
-          "optimizer_states_gib": 12.691,
-          "shard_gradient_gib": 0.0,
-          "other_gib": 0.115
+        "run_peak": {
+          "phase": "after_optimizer_step",
+          "rank": 0,
+          "phase_peak_gib": 38.562
         }
       },
-      "iteration_ms": 236.559
+      "iteration_ms": 215.54
     }
   ]
 }
