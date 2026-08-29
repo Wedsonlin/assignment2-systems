@@ -2,9 +2,6 @@
 import torch
 import torch.nn as nn
 
-from cs336_basics.optimizer import AdamW
-from cs336_basics.nn_utils import cross_entropy
-
 class ToyModel(nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()

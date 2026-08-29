@@ -34,13 +34,6 @@ class NaiveDDP(torch.nn.Module):
         for param in self.module.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        
-        # grads_list = [param.grad for param in self.module.parameters() if param.grad is not None]
-        # flattened_grads = torch._utils._flatten_dense_tensors(grads_list)
-        # dist.all_reduce(flattened_grads, op=dist.ReduceOp.AVG)
-        # unflattened_grads = torch._utils._unflatten_dense_tensors(flattened_grads, grads_list)
-        # for dst, src in zip(grads_list, unflattened_grads):
-        #     dst.copy_(src)
 
 class OptimizedDDP(NaiveDDP):
     def __init__(self, module: torch.nn.Module):

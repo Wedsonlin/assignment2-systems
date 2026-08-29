@@ -1,8 +1,8 @@
-import timeit
 import argparse
+import timeit
+from statistics import fmean, pstdev
 from typing import Literal
 
-import numpy as np
 import torch
 import torch.nn as nn
 from cs336_basics.model import BasicsTransformerLM
@@ -19,85 +19,43 @@ def benchmark(
     autocast: bool = True
 ):
     batch_size = 4
-    warmup_inputs = torch.randint(
-            low=0,
-            high=model.config["vocab_size"],
-            size=(warmup_steps, batch_size, model.config["context_length"]),
-            dtype=torch.long,
-            device=device
+    vocab_size = model.config["vocab_size"]
+    context_length = model.config["context_length"]
+
+    def make_batches(steps):
+        shape = (steps, batch_size, context_length)
+        return (
+            torch.randint(vocab_size, shape, device=device),
+            torch.randint(vocab_size, shape, device=device),
         )
-    warmup_targets = torch.randint(
-            low=0,
-            high=model.config["vocab_size"],
-            size=(warmup_steps, batch_size, model.config["context_length"]),
-            dtype=torch.long,
-            device=device       
-        )
-    execution_inputs = torch.randint(
-            low=0,
-            high=model.config["vocab_size"],
-            size=(execution_steps, batch_size, model.config["context_length"]),
-            dtype=torch.long,
-            device=device
-        )
-    execution_targets = torch.randint(
-            low=0,
-            high=model.config["vocab_size"],
-            size=(execution_steps, batch_size, model.config["context_length"]),
-            dtype=torch.long,
-            device=device        
-        )   
+
+    warmup_inputs, warmup_targets = make_batches(warmup_steps)
+    execution_inputs, execution_targets = make_batches(execution_steps)
+
+    if pattern not in {"forward-only", "forward-and-backward", "full-training-step"}:
+        raise ValueError(f"Unsupported benchmark pattern: {pattern}")
+
+    def step(inputs, targets):
+        if pattern == "forward-only":
+            model(inputs)
+            return
+
+        optimizer.zero_grad()
+        loss = cross_entropy(model(inputs), targets)
+        loss.backward()
+        if pattern == "full-training-step":
+            optimizer.step()
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast):
-        if pattern == "forward-only":
-            for i in range(warmup_steps):
-                model(warmup_inputs[i])
-            torch.cuda.synchronize()
-            
-            start = timeit.default_timer()
-            for i in range(execution_steps):
-                model(execution_inputs[i])
-                torch.cuda.synchronize()
-            end = timeit.default_timer()
-            return (end - start) / execution_steps
+        for inputs, targets in zip(warmup_inputs, warmup_targets):
+            step(inputs, targets)
+        torch.cuda.synchronize()
 
-        elif pattern == "forward-and-backward":
-            for i in range(warmup_steps):
-                optimizer.zero_grad()
-                output = model(warmup_inputs[i])
-                loss = cross_entropy(output, warmup_targets[i])
-                loss.backward()
+        start = timeit.default_timer()
+        for inputs, targets in zip(execution_inputs, execution_targets):
+            step(inputs, targets)
             torch.cuda.synchronize()
-
-            start = timeit.default_timer()
-            for i in range(execution_steps):
-                optimizer.zero_grad()
-                output = model(execution_inputs[i])
-                loss = cross_entropy(output, execution_targets[i])
-                loss.backward()
-                torch.cuda.synchronize()
-            end = timeit.default_timer()
-            return (end - start) / execution_steps
-
-        elif pattern == "full-training-step":
-            for i in range(warmup_steps):
-                optimizer.zero_grad()
-                output = model(warmup_inputs[i])
-                loss = cross_entropy(output, warmup_targets[i])
-                loss.backward()
-                optimizer.step()
-            torch.cuda.synchronize()
-            
-            start = timeit.default_timer()
-            for i in range(execution_steps):
-                optimizer.zero_grad()
-                output = model(execution_inputs[i])
-                loss = cross_entropy(output, execution_targets[i])
-                loss.backward()
-                optimizer.step()
-                torch.cuda.synchronize()
-            end = timeit.default_timer()
-            return (end - start) / execution_steps
+        return (timeit.default_timer() - start) / execution_steps
 
 
 if __name__ == "__main__":
@@ -127,9 +85,8 @@ if __name__ == "__main__":
     model.to(device)
     optimizer = AdamW(model.parameters())
     
-    lantecys = []
-    for _ in range(args.repeat_times):
-        lantecys.append(benchmark(
+    latencies = [
+        benchmark(
             model=model, 
             optimizer=optimizer,
             device=device,
@@ -137,7 +94,9 @@ if __name__ == "__main__":
             execution_steps=args.execution_steps,
             pattern=args.pattern,
             autocast=True if args.autocast == "true" else False,
-        ))
-    avg = np.mean(lantecys)
-    std = np.std(lantecys)
+        )
+        for _ in range(args.repeat_times)
+    ]
+    avg = fmean(latencies)
+    std = pstdev(latencies)
     print(f"Latency: {avg:.5f} seconds ± {std:.5f} seconds")

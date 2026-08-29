@@ -4,7 +4,6 @@ import json
 import os
 import timeit
 from pathlib import Path
-from typing import Type
 
 import torch
 import torch.distributed as dist
@@ -17,61 +16,23 @@ from cs336_systems.ddp import OptimizedDDP
 
 
 class ShardedOptimizer(Optimizer):
-    @torch.no_grad()
-    def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs):
-        self.list_params = []
-        ids = set()
-        for p in params:
-            if id(p) not in ids and p.requires_grad:
-                self.list_params.append(p)
-                ids.add(id(p))
-
-        n_params = sum(p.numel() for p in self.list_params)
-        self.flatten_buffer = torch.empty(n_params, dtype=self.list_params[0].dtype, device=self.list_params[0].device)
-
-        offest = 0
-        for p in self.list_params:
-            self.flatten_buffer[offest:offest+p.numel()].copy_(p.data.view(-1))
-            p.set_(self.flatten_buffer[offest:offest+p.numel()].view_as(p))
-            offest += p.numel()
-
+    def __init__(self, params, optimizer_cls: type[Optimizer], **kwargs):
+        self.params = [param for param in params if param.requires_grad]
+        super().__init__(self.params, defaults={})
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        offset_per_rank = n_params // world_size # rquire n_params % world_size == 0
-        self.start = rank * offset_per_rank
-        self.end = self.start + offset_per_rank
-        self.shard = self.flatten_buffer[self.start:self.end]
-
-        self.local_params = []
-        self.local_mappings = []
-        offset = 0
-        for p in self.list_params:
-            global_start = max(offset, self.start)
-            global_end  = min(offset + p.numel(), self.end)
-            if global_start < global_end:
-                local_param = self.flatten_buffer[global_start:global_end]
-                local_start = global_start - offset
-                local_end = global_end - offset
-
-                self.local_params.append(local_param)
-                self.local_mappings.append(
-                    (local_param, p, local_start, local_end)
-                )
-            offset += p.numel()
-
-        super().__init__(self.list_params, defaults={})
-        self.optimizer = optimizer_cls(self.local_params, **kwargs)
+        self.world_size = dist.get_world_size()
+        # ponytail: parameter-level sharding; flatten only if measured imbalance matters.
+        self.optimizer = optimizer_cls(self.params[rank::self.world_size], **kwargs)
 
     def zero_grad(self, set_to_none: bool = True):
-        super().zero_grad(set_to_none)
-        self.optimizer.zero_grad(set_to_none=True)
+        super().zero_grad(set_to_none=set_to_none)
 
     def step(self, closure=None, **kwargs):
-        for local_param, p, start, end in self.local_mappings:
-            local_param.grad = p.grad.view(-1)[start:end]
-
-        self.optimizer.step(closure, **kwargs)
-        dist.all_gather_into_tensor(self.flatten_buffer, self.shard)
+        loss = self.optimizer.step(closure, **kwargs)
+        with torch.no_grad():
+            for index, param in enumerate(self.params):
+                dist.broadcast(param, src=index % self.world_size)
+        return loss
 
 
 GIB = 1024**3
@@ -240,4 +201,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

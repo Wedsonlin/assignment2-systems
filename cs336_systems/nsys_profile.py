@@ -7,10 +7,10 @@ import torch.nn as nn
 import torch.cuda.nvtx as nvtx
 from torch import Tensor
 from jaxtyping import Bool, Float
-from einops import einsum, rearrange
+from einops import einsum
 
 import cs336_basics
-from cs336_basics.model import BasicsTransformerLM, AnnotatedBasicsTransformerLM
+from cs336_basics.model import AnnotatedBasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.nn_utils import softmax
@@ -232,7 +232,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.memory_profiler == None:
+    if args.memory_profiler is None:
         cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
     model = AnnotatedBasicsTransformerLM(
         vocab_size=args.vocab_size,
@@ -255,22 +255,12 @@ if __name__ == "__main__":
             autocast=True if args.autocast == "true" else False,
             pattern=args.pattern,
         )
-    elif args.memory_profiler == "nvtx":
-        args.execution_steps = 1
-        nvtx_profile(
-            model=model, 
-            optimizer=optimizer,
-            device=device,
-            warmup_steps=args.warmup_steps,
-            execution_steps=args.execution_steps,
-            autocast=True if args.autocast == "true" else False,
-        )
     else:
         nvtx_profile(
             model=model, 
             optimizer=optimizer,
             device=device,
             warmup_steps=args.warmup_steps,
-            execution_steps=args.execution_steps,
+            execution_steps=1 if args.memory_profiler == "nvtx" else args.execution_steps,
             autocast=True if args.autocast == "true" else False,
         )
