@@ -353,7 +353,7 @@ def main():
 
 """
 uv run nsys profile \
-  -o results/nsys/fsdp_small_nccl_fp16_ws2 \
+  -o results/fsdp_small_nccl_fp16 \
   --force-overwrite=true \
   --trace=cuda,nvtx,osrt,nccl \
   --pytorch=functions-trace \
@@ -365,7 +365,7 @@ uv run nsys profile \
     --world-size 2 \
     --batch-size 4 \
     --mixed-precision \
-    --output-dir results/fsdp
+    --output-dir results
 """
 
 if __name__ == "__main__":
