@@ -1,0 +1,105 @@
+{
+  "config": {
+    "model_size": "small",
+    "backend": "nccl",
+    "world_size": 2,
+    "batch_size": 4,
+    "warmup_steps": 5,
+    "steps": 10,
+    "mixed_precision": true,
+    "output_dir": "results",
+    "model": {
+      "vocab_size": 10000,
+      "context_length": 512,
+      "d_model": 768,
+      "d_ff": 3072,
+      "num_layers": 12,
+      "num_heads": 12
+    },
+    "compute_dtype": "fp16"
+  },
+  "full_num_parameters": 128625408,
+  "local_num_parameters": 64322304,
+  "memory": {
+    "per_rank": [
+      {
+        "rank": 0,
+        "phases": {
+          "after_model_init": {
+            "allocated_gib": 0.258,
+            "phase_peak_gib": 0.495,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.0,
+            "optimizer_states_gib": 0.0,
+            "other_gib": 0.018
+          },
+          "before_optimizer_step": {
+            "allocated_gib": 0.577,
+            "phase_peak_gib": 1.707,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.24,
+            "optimizer_states_gib": 0.0,
+            "other_gib": 0.098
+          },
+          "after_optimizer_step": {
+            "allocated_gib": 1.08,
+            "phase_peak_gib": 1.109,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.24,
+            "optimizer_states_gib": 0.479,
+            "other_gib": 0.122
+          }
+        }
+      },
+      {
+        "rank": 1,
+        "phases": {
+          "after_model_init": {
+            "allocated_gib": 0.257,
+            "phase_peak_gib": 0.495,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.0,
+            "optimizer_states_gib": 0.0,
+            "other_gib": 0.017
+          },
+          "before_optimizer_step": {
+            "allocated_gib": 0.577,
+            "phase_peak_gib": 1.707,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.24,
+            "optimizer_states_gib": 0.0,
+            "other_gib": 0.097
+          },
+          "after_optimizer_step": {
+            "allocated_gib": 1.079,
+            "phase_peak_gib": 1.108,
+            "parameters_gib": 0.24,
+            "gradients_gib": 0.24,
+            "optimizer_states_gib": 0.479,
+            "other_gib": 0.12
+          }
+        }
+      }
+    ],
+    "max_phase_peaks": {
+      "after_model_init": {
+        "rank": 0,
+        "phase_peak_gib": 0.495
+      },
+      "before_optimizer_step": {
+        "rank": 0,
+        "phase_peak_gib": 1.707
+      },
+      "after_optimizer_step": {
+        "rank": 0,
+        "phase_peak_gib": 1.109
+      }
+    },
+    "run_peak": {
+      "phase": "before_optimizer_step",
+      "rank": 0,
+      "phase_peak_gib": 1.707
+    }
+  },
+  "iteration_ms": 128.918
+}

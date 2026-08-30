@@ -353,14 +353,14 @@ def main():
 
 """
 uv run nsys profile \
-  -o results/fsdp_small_nccl_fp16 \
+  -o results/fsdp_xl_nccl_fp16 \
   --force-overwrite=true \
   --trace=cuda,nvtx,osrt,nccl \
   --pytorch=functions-trace \
   --sample=none \
   --wait=all \
   -- python -m cs336_systems.fsdp \
-    --model-size small \
+    --model-size xl \
     --backend nccl \
     --world-size 2 \
     --batch-size 4 \
