@@ -13,6 +13,7 @@ from torch.optim import Optimizer
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_systems.ddp import OptimizedDDP
+from cs336_systems.profile_utils import memory_snapshot, summarize_memory
 
 
 class ShardedOptimizer(Optimizer):
@@ -33,33 +34,6 @@ class ShardedOptimizer(Optimizer):
             for index, param in enumerate(self.params):
                 dist.broadcast(param, src=index % self.world_size)
         return loss
-
-
-GIB = 1024**3
-
-
-def memory_snapshot(model, optimizer=None):
-    torch.cuda.synchronize()
-    parameters = sum(p.numel() * p.element_size() for p in model.parameters())
-    gradients = sum(p.grad.numel() * p.grad.element_size() for p in model.parameters() if p.grad is not None)
-    inner_optimizer = optimizer.optimizer if isinstance(optimizer, ShardedOptimizer) else optimizer
-    optimizer_states = 0 if inner_optimizer is None else sum(
-        value.numel() * value.element_size()
-        for state in inner_optimizer.state.values()
-        for value in state.values()
-        if torch.is_tensor(value)
-    )
-    allocated = torch.cuda.memory_allocated()
-    result = {
-        "allocated_gib": allocated / GIB,
-        "phase_peak_gib": torch.cuda.max_memory_allocated() / GIB,
-        "parameters_gib": parameters / GIB,
-        "gradients_gib": gradients / GIB,
-        "optimizer_states_gib": optimizer_states / GIB,
-        "other_gib": (allocated - parameters - gradients - optimizer_states) / GIB,
-    }
-    torch.cuda.reset_peak_memory_stats()
-    return {key: round(value, 3) for key, value in result.items()}
 
 
 def compute_loss(model, inputs, targets, mixed_precision: bool):
@@ -132,34 +106,13 @@ def run_experiment(rank, args):
         dist.gather_object({"rank": rank, "phases": memory}, memory_per_rank, dst=0)
 
         if rank == 0:
-            max_phase_peaks = {}
-            for phase in memory:
-                worst = max(
-                    memory_per_rank,
-                    key=lambda item: item["phases"][phase]["phase_peak_gib"],
-                )
-                max_phase_peaks[phase] = {
-                    "rank": worst["rank"],
-                    "phase_peak_gib": worst["phases"][phase]["phase_peak_gib"],
-                }
-            run_peak_phase = max(
-                max_phase_peaks,
-                key=lambda phase: max_phase_peaks[phase]["phase_peak_gib"],
-            )
             results.append(
                 {
                     "mode": "sharded" if sharded else "baseline",
                     "mixed_precision": args.mixed_precision,
                     "compute_dtype": "bf16" if args.mixed_precision else "fp32",
                     "num_parameters": sum(p.numel() for p in model.parameters()),
-                    "memory": {
-                        "per_rank": memory_per_rank,
-                        "max_phase_peaks": max_phase_peaks,
-                        "run_peak": {
-                            "phase": run_peak_phase,
-                            **max_phase_peaks[run_peak_phase],
-                        },
-                    },
+                    "memory": summarize_memory(memory, memory_per_rank),
                     "iteration_ms": round(iteration_ms.item(), 3),
                 }
             )
