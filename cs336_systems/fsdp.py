@@ -40,7 +40,7 @@ class FSDP(torch.nn.Module):
 
                 if is_sharded:
                     for param in submodule.parameters(recurse=False):
-                        param_id = id(param)
+                        param_id = id(param) # avoid repeating sharding the same parameter
                         if param_id not in self._shards:
                             param.data = param.data.chunk(self.world_size, dim=0)[self.rank].contiguous().clone()
                             self._shards[param_id] = param.data
@@ -49,12 +49,12 @@ class FSDP(torch.nn.Module):
                     submodule.register_forward_pre_hook(self._forward_pre_hook)
                     submodule.register_forward_hook(self._forward_post_hook)
 
-                    if isinstance(submodule, Linear):
+                    if isinstance(submodule, Linear): # only Linear needs to use parameters in backward pass
                         submodule.register_full_backward_pre_hook(self._backward_pre_hook)
 
                 for param in submodule.parameters(recurse=False):
                     param_id = id(param)
-                    if param.requires_grad and param_id not in hook_params:
+                    if param.requires_grad and param_id not in hook_params: # avoid repeating registering hook on the same parameter
                         param.register_post_accumulate_grad_hook(self._backward_post_hook(submodule))
                         hook_params.add(param_id)
 
@@ -134,7 +134,7 @@ class FSDP(torch.nn.Module):
             return
 
         prefetch_index = self._forward_index + 1
-        if prefetch_index < len(self._forward_order):
+        if prefetch_index < len(self._forward_order): # prefetch the next module's parameters
             next_module = self._forward_order[prefetch_index]
             pending = self.async_all_gather_params(next_module)
             self._pending_gather[prefetch_index] = pending
@@ -162,13 +162,13 @@ class FSDP(torch.nn.Module):
     def _finish_grad_work(self, item):
         param, _, work_output, work = item
         work.wait()
-        param.grad = work_output.to(torch.float32)
+        param.grad = work_output
 
 
     def _queue_grad_work(self, item):
         self._grad_works.append(item)
 
-        if len(self._grad_works) > 2: # at most preserve 2 grads
+        if len(self._grad_works) > 2: # at most two gradient works at the time
             self._finish_grad_work(self._grad_works.pop(0))
 
 
@@ -183,15 +183,15 @@ class FSDP(torch.nn.Module):
                 param.data = shard
                 if param.grad is None:
                     return 
-                full_grad = param.grad.contiguous()
-                dtype = self.compute_dtype if self.compute_dtype is not None else full_grad.dtype
-                shard_grad = torch.empty_like(shard, dtype=dtype)
+                full_grad = param.grad.to(torch.float32)
+                shard_grad = torch.empty_like(shard, dtype=torch.float32) # keep gradient update in fp32
                 work = dist.reduce_scatter_tensor(shard_grad, full_grad, op=dist.ReduceOp.AVG, async_op=True)
                 self._queue_grad_work((param, full_grad, shard_grad, work))
         else:
             def hook(param):
                 if param.grad is None:
                     return
+                param.grad = param.grad.to(torch.float32) # keep gradient update in fp32
                 work = dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
                 self._queue_grad_work((param, param.grad, param.grad, work))
         return hook
